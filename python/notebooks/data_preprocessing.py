@@ -1,17 +1,17 @@
 import pandas as pd
 import numpy as np
 
-def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19',imputing_window=1) -> pd.DataFrame:
+def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19', maximum_date = '2022-05-01') -> pd.DataFrame:
+    
     '''
     Main steps of this initial preprocessing:
 
     - Drop useless columns.
-    - Column name normalization.
+    - Columns renaming.
     - Filter initial date (default = 2017-09-19).
     - Drop rows with all missing.
     - Build a timestamp and an year columns.
     - Wind speed extrapolation to 120m.
-    X. Basic data imputation (roll forward or interpolation for 1h).
 
     Parameters
     ----------
@@ -19,9 +19,6 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     df_input: dataframe to preprocess
 
     minimum_date: minimum date to filter dataframe.
-
-    imputing_window: forward window to impute data. The value will propagate forward in case of missing value. (This does not apply on the target variables)
-
 
     Returns 
     ----------
@@ -60,7 +57,7 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     'VENTO, VELOCIDADE HORARIA(m/s)': 'WIND_SPEED_ms'
     },inplace=True)
 
-    df = df.query("DATE_MEASUREMENT >= @minimum_date")
+    df = df.query("DATE_MEASUREMENT >= @minimum_date and DATE_MEASUREMENT <= @maximum_date")
 
     rows_with_no_data = df.drop(columns=['DATE_MEASUREMENT','HOUR_MEASUREMENT']).isna().all(axis=1) #not considering the date and hour because they are always present.
     df = df.loc[~(rows_with_no_data),:]
@@ -70,9 +67,10 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     df['DATETIME'] = pd.to_datetime(df['DATE_MEASUREMENT'] + ' ' + df['HOUR_MEASUREMENT'].astype(str) + ':00:00')
 
 
-    # TODO: Data imputation
-
     df['WIND_SPEED_120m_ms'] = df['WIND_SPEED_ms'] * (120/5) ** 0.14 #wind speed extrapolation to 120m meters of height and alpha = 0.14
 
     print("Dataset final size: ",df.shape)
     return df.reset_index(drop=True)
+
+
+    # imputing_window: forward window to impute data. The value will propagate forward in case of missing value. (This does not apply on the target variables)
