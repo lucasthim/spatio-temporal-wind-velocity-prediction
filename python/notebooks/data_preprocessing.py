@@ -63,11 +63,14 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     df = df.loc[~(rows_with_no_data),:]
     
     df['YEAR'] = df['DATE_MEASUREMENT'].str.split('-').str[0]
-    df['HOUR_MEASUREMENT'] = (df['HOUR_MEASUREMENT'] / 100).astype(int)
-    df['DATETIME'] = pd.to_datetime(df['DATE_MEASUREMENT'] + ' ' + df['HOUR_MEASUREMENT'].astype(str) + ':00:00')
-
-
+    df['MONTH'] = df['DATE_MEASUREMENT'].str.split('-').str[1]
+    df['DAY'] = df['DATE_MEASUREMENT'].str.split('-').str[2]
+    df['HOUR'] = (df['HOUR_MEASUREMENT'] / 100).astype(int)
+    df['DATETIME'] = pd.to_datetime(df['DATE_MEASUREMENT'] + ' ' + df['HOUR'].astype(str) + ':00:00')
+    
     df['WIND_SPEED_120m_ms'] = df['WIND_SPEED_ms'] * (120/5) ** 0.14 #wind speed extrapolation to 120m meters of height and alpha = 0.14
+
+    df.drop(columns=['HOUR_MEASUREMENT'],inplace=True)
 
     print("Dataset final size: ",df.shape)
     return df.reset_index(drop=True)
