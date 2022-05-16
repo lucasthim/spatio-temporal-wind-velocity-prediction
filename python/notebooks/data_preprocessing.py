@@ -76,4 +76,61 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     return df.reset_index(drop=True)
 
 
-    # imputing_window: forward window to impute data. The value will propagate forward in case of missing value. (This does not apply on the target variables)
+def prepare_data_for_feature_generation(df,cols_to_fill,fillna_method = 'forward_fill'):
+    '''
+    Function to prepare dataset for feature generation.
+    
+    Steps are:
+
+    - Resample dataset in order to maintain hour time structure, since there are some missing hours.
+
+    - Forward fill of missing values. 
+    
+    Parameters
+    ----------
+
+    df: main dataset containing metheorological data from automatic stations.
+
+    fillna_method: Flag to indicate type of missing value filling. Possible methods are: None, 'rolling' or 'forward_fill'. If it is None, no imputation is used.
+
+
+    Returns
+    ---------
+    
+    '''
+    station_codes = df['CODE'].unique()
+    station_names = df['NAME'].unique()
+    stations_data = []
+    for code,name in zip(station_codes,station_names):
+
+        df_code = df.query("CODE == @code")
+        size_before = df_code.shape[0]
+        print(f"Processing station {code}-{name}. Current size: {size_before} hour points.")
+        df_code = resample_hours_for_wind_speed(df_code)
+        df_code.sort_values(by='DATETIME',ascending=True,inplace=True)
+        size_after = df_code.shape[0]
+        print(f"Resampled {size_after-size_before} hour points\n")
+        if fillna_method == 'forward_fill':
+            df_code = forward_fillna(df_code,cols_to_fill)
+        elif fillna_method == 'rolling':
+            df_code = rolling_average_fillna(df_code,cols_to_fill)
+
+        stations_data.append(df_code)
+    df_stations = pd.concat(stations_data)
+    return df_stations
+
+def resample_hours_for_wind_speed(df):
+    df  = df.set_index('DATETIME').resample('H').first().reset_index('DATETIME')
+    df['HOUR'] = df['DATETIME'].dt.hour
+    df['DAY'] = df['DATETIME'].dt.day
+    df['MONTH'] = df['DATETIME'].dt.month
+    df['YEAR'] = df['DATETIME'].dt.year
+    return df
+
+def forward_fillna(df,cols_to_fill):
+    df[cols_to_fill] = df[cols_to_fill].fillna(method='ffill',limit=2)
+    return df
+
+def rolling_average_fillna(df,cols_to_fill):
+    df[cols_to_fill] = df[cols_to_fill].fillna(df[cols_to_fill].rolling(window=6).mean(min_periods=3),limit=2)
+    return df
