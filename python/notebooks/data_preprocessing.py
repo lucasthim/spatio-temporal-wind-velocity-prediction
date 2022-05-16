@@ -107,6 +107,18 @@ def prepare_data_for_feature_generation(df,cols_to_fill,fillna_method = 'forward
         size_before = df_code.shape[0]
         print(f"Processing station {code}-{name}. Current size: {size_before} hour points.")
         df_code = resample_hours_for_wind_speed(df_code)
+
+        df_code['HOUR'] = df_code['DATETIME'].dt.hour
+        df_code['DAY'] = df_code['DATETIME'].dt.day
+        df_code['MONTH'] = df_code['DATETIME'].dt.month
+        df_code['YEAR'] = df_code['DATETIME'].dt.year
+
+        df_code['ALTITUDE'] = df_code['ALTITUDE'].iloc[0]
+        df_code['LATITUDE'] = df_code['LATITUDE'].iloc[0]
+        df_code['LONGITUDE'] = df_code['LONGITUDE'].iloc[0]
+        df_code['CODE'] = df_code['CODE'].iloc[0]
+        df_code['NAME'] = df_code['NAME'].iloc[0]
+
         df_code.sort_values(by='DATETIME',ascending=True,inplace=True)
         size_after = df_code.shape[0]
         print(f"Resampled {size_after-size_before} hour points\n")
@@ -121,10 +133,6 @@ def prepare_data_for_feature_generation(df,cols_to_fill,fillna_method = 'forward
 
 def resample_hours_for_wind_speed(df):
     df  = df.set_index('DATETIME').resample('H').first().reset_index('DATETIME')
-    df['HOUR'] = df['DATETIME'].dt.hour
-    df['DAY'] = df['DATETIME'].dt.day
-    df['MONTH'] = df['DATETIME'].dt.month
-    df['YEAR'] = df['DATETIME'].dt.year
     return df
 
 def forward_fillna(df,cols_to_fill):
@@ -134,3 +142,4 @@ def forward_fillna(df,cols_to_fill):
 def rolling_average_fillna(df,cols_to_fill):
     df[cols_to_fill] = df[cols_to_fill].fillna(df[cols_to_fill].rolling(window=6).mean(min_periods=3),limit=2)
     return df
+
