@@ -46,11 +46,11 @@ def make_experiment_dataset(df:pd.DataFrame,hourly_features:list,lags:list,rolli
         df_code = df.query("CODE == @code").sort_values(by='DATETIME',ascending=True)
         df_features = make_features(df_code,hourly_features,lags,rolling_windows,hour_feature,target_shift)
         df_target = make_target(df_code[targets].copy(),targets,target_shift)
+        df_target.drop(columns=targets,inplace=True) #dropping former name of targets.
         df_code_dataset = pd.concat([df_features,df_target],axis=1)
         final_data.append(df_code_dataset)
 
     df_final_dataset = pd.concat(final_data)
-    df_final_dataset = drop_duplicate_columns(df_final_dataset)
     return df_final_dataset
 
 def make_features(df:pd.DataFrame,hourly_features:list,lags:list,rolling_windows:list, hour_feature = 'HOUR', target_shift = 1) -> pd.DataFrame:
@@ -153,7 +153,3 @@ def make_target(df,targets,target_shift = 1):
         for target in target_shift:
             df[[t + f'_target_{target}h' for t in targets]] = df[targets].shift(-target)
     return df
-
-def drop_duplicate_columns(df):
-    columns = list(set(df.columns.tolist()))
-    return df[columns]
