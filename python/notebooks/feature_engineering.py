@@ -64,12 +64,20 @@ def make_wind_prediction_dataset(df:pd.DataFrame,granularity:str, main_features:
     return df_final_dataset
 
 def change_granularity_of_dataset_to_day(df):
+
+    code = df['CODE'].iloc[0]
+    name = df['CODE'].iloc[0]
+    
     df['DATE'] = pd.to_datetime(df['DATETIME'].dt.date)
     df.drop(columns=['DATETIME'],inplace=True)
     df_count = df.set_index('DATE').resample('D').agg('count')
     df_mean = df.set_index('DATE').resample('D').agg('mean')
+
     df_mean[df_count < 12] = np.nan # in case the day has less than 12 points, replace for null.
-    return df_mean.reset_index()
+    df_mean['CODE'] = code
+    df_mean['NAME'] = name
+
+    return df_mean.reset_index().drop(columns=['HOUR'])
 
 def make_features(df:pd.DataFrame, granularity:str, main_features:list, lags:list, rolling_windows:list, target_shift = 1) -> pd.DataFrame:
     '''
@@ -190,16 +198,23 @@ def get_time_suffix(granularity):
         time_suffix = 'd'
     return time_suffix
 
-def drop_null_features_and_instances(df,null_percentage=0.2):
+def drop_null_features_and_instances(df,feature_null_percentage=0.2,instance_null_percentage=0.8):
     '''Drop features and instances that are above a null percentage.'''
 
-    dataset_size = df.shape[0]
-    feature_size = df.shape[1]
-    nulls = df.isnull().sum() / dataset_size
-    nulls_20_percent = nulls[nulls > null_percentage]
-    cols_nulls_20_percent = nulls_20_percent.index.tolist()
-    non_null_tresh = np.round(df.drop(columns=cols_nulls_20_percent).shape[1])
-    df_selected = df.drop(columns=cols_nulls_20_percent)
-
-    # df_selected = df_selected.dropna(axis=0,thresh=non_null_tresh)
+    dataset_initial_size = df.shape[0]
+    
+    print("Initial dataset size:",df.shape)
+    nulls = df.isnull().sum() / dataset_initial_size
+    nulls_percent = nulls[nulls > feature_null_percentage]
+    print(f"There were {nulls_percent.shape[0]} features with more than {feature_null_percentage*100}% of null values:")
+    
+    cols_nulls_percent = nulls_percent.index.tolist()
+    non_null_tresh = np.round(df.drop(columns=cols_nulls_percent).shape[1])
+    df_selected = df.drop(columns=cols_nulls_percent)
+    total_instances = df_selected.shape[0]
+    
+    df_selected = df_selected.dropna(axis=0,thresh=non_null_tresh* instance_null_percentage)
+    processed_instances = df_selected.shape[0]
+    
+    print(f"There were a total of {total_instances-processed_instances} with less than {instance_null_percentage*100}% of avaiable data (features).")
     return df_selected
