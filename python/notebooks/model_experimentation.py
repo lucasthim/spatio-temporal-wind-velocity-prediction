@@ -7,31 +7,36 @@ from sklearn.preprocessing import MinMaxScaler
 
 def setup_datasets_for_experiment(df,test_year=2020,validation_year=2019,target_format='1h',target_name='WIND_SPEED_ms',targets_to_drop=[]):
 
-    df_train_initial = df.query("DATETIME.dt.year != @test_year")
-    df_validation = df_train_initial.query("DATETIME.dt.year == @validation_year")
-    df_train = df_train_initial.query("DATETIME.dt.year != @validation_year")
-    df_test = df.query("DATETIME.dt.year == @test_year")
 
-    features_to_drop = ['NAME', 'CODE', 'DATETIME', 'YEAR']
+    features_to_drop = ['NAME', 'CODE', 'YEAR']
 
-    if target_format == '1h':
-        features_to_drop = features_to_drop + ['HOUR_target_3h', 'HOUR_target_6h']
-    elif target_format == '3h':
-        features_to_drop = features_to_drop + ['HOUR_target_1h', 'HOUR_target_6h']
-    elif target_format == '6h':
-        features_to_drop = features_to_drop + ['HOUR_target_3h', 'HOUR_target_1h']
+    if 'h' in target_format:
+        exception = f'HOUR_TARGET_{target_format}'
+        target_hours = [f'HOUR_TARGET_{str(x)}d' for x in range(1,7)]
+        features_to_drop = features_to_drop + ['DATETIME'] + [x for x in target_hours if x != exception]
     
+    elif 'd' in target_format:
+        exception = f'DAY_TARGET_{target_format}'
+        target_days = [f'DAY_TARGET_{str(x)}d' for x in range(1,8)]
+        features_to_drop = features_to_drop + ['DATE'] + [x for x in target_days if x != exception]
+
     if targets_to_drop == []:
-        targets_to_drop = ['WIND_SPEED_ms_target_3h','WIND_SPEED_ms_target_6h', 
+        targets_to_drop = ['WIND_SPEED_ms_target_3h','WIND_SPEED_ms_target_6h','WIND_SPEED_ms_target_1h', 
                             'WIND_DIRECTION_degrees_target_1h', 'WIND_DIRECTION_degrees_target_3h', 
                             'WIND_DIRECTION_degrees_target_6h', 'WIND_MAX_GUNS_ms_target_1h',
                             'WIND_MAX_GUNS_ms_target_3h', 'WIND_MAX_GUNS_ms_target_6h']
 
     target = [target_name+ '_target_' + target_format]
 
+    df_train_initial = df.query(f"YEAR != @test_year")
+    df_validation = df_train_initial.query(f"YEAR == @validation_year")
+    df_train = df_train_initial.query(f"YEAR != @validation_year")
+    df_test = df.query(f"YEAR == @test_year")
+
+    features_to_drop = list(set(features_to_drop).intersection(set(df_train.columns.tolist())))
     X_train,y_train = feature_target_split(df_train.dropna(subset=target).fillna(0),features_to_drop,targets_to_drop,target)
     X_test,y_test = feature_target_split(df_test.dropna(subset=target).fillna(0),features_to_drop,targets_to_drop,target)
-
+    
     scaler = MinMaxScaler()
     X_train_norm = scaler.fit_transform(X_train)
     X_test_norm = scaler.transform(X_test)
@@ -43,10 +48,6 @@ def setup_datasets_for_experiment(df,test_year=2020,validation_year=2019,target_
 
     return X_train_norm, y_train, X_test_norm, y_test
 
-def train_test_split_by_year(df,test_year=2020) -> tuple[pd.DataFrame]:
-    df_train = df.query("DATETIME.dt.year != @test_year")
-    df_test = df.query("DATETIME.dt.year == @test_year")
-    return df_train,df_test
 
 def feature_target_split(df,features_to_drop,targets_to_drop,target) -> tuple[pd.DataFrame]:
     X = df.drop(columns=(features_to_drop+targets_to_drop+target))
@@ -56,8 +57,9 @@ def feature_target_split(df,features_to_drop,targets_to_drop,target) -> tuple[pd
 def evaluate_predictions(y_pred,y_true,max_prediction,min_prediction=0,set='Train'):
 
     y_pred = treat_output(y_pred,max=max_prediction,min=min_prediction)
-    _ = calculate_erros(y_pred = y_pred,y_true = y_true)
+    mae,rmse = calculate_erros(y_pred = y_pred,y_true = y_true)
     compare_distributions(y_pred,y_true,set)
+    return mae,rmse
 
 def treat_output(y_pred,max,min):
     y_pred[y_pred > max] = 1.5 * max

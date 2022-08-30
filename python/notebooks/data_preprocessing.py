@@ -75,7 +75,6 @@ def initial_data_preprocessing(df_input:pd.DataFrame,minimum_date = '2017-09-19'
     print("Dataset final size: ",df.shape)
     return df.reset_index(drop=True)
 
-
 def prepare_data_for_feature_generation(df,cols_to_fill,fillna_method = 'forward_fill'):
     '''
     Function to prepare dataset for feature generation.
