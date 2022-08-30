@@ -1,0 +1,1443 @@
+---
+title: "Rotina Space-Time ARIMA"
+output: html_document
+---
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+#Carregamento de Bibliotecas
+library(plyr)
+library(magrittr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(ggstatsplot)
+library(RColorBrewer)
+library(scales)
+library(GGally)
+library(pander)
+library(rpart)
+library(rpart.plot)
+library(tidyverse)
+library(lubridate)
+library(tseries)
+library(pracma) #Necessárias para a nls.lm (Levenberg Marquadt)
+library(minpack.lm) #Necessárias para a nls.lm (Levenberg Marquadt)
+library(ggpubr)
+library(forecast)
+library(starma)
+library(sp)
+```
+
+
+# LEITURA E TRATATAMENTO INICIAL DOS DADOS
+
+
+## Leitura dos dados temporais e criação do data.frame temporal
+
+
+```{r}
+#Leitura dos Dados Temporais
+wind_data <- read_csv("wind_data_conde_and_adjacent_stations.csv")
+summary(wind_data$DATETIME)
+unique(wind_data$NAME)
+
+wind_data_mean <- wind_data %>% 
+  filter(!is.na(WIND_SPEED_ms) & !NAME %in% c("RIBEIRA DO AMPARO","FEIRA DE SANTANA","EUCLIDES DA CUNHA","QUEIMADAS","CRUZ DAS ALMAS")) %>% 
+  group_by(YEAR, MONTH, DAY, NAME, LATITUDE, LONGITUDE) %>% 
+  summarise(WIND_SPEED_ms_mean = mean(WIND_SPEED_ms, na.rm = T)) 
+
+wind_data_day <- wind_data_mean %>% 
+  ungroup() %>% 
+  filter(YEAR > 2017 & YEAR <  2021) %>%
+  mutate(DATA = as.POSIXct(paste0(YEAR,"-",MONTH,"-",DAY), format="%Y-%m-%d")) %>% 
+  dplyr::select(DATA,  WIND_SPEED_ms_mean, NAME, LATITUDE,LONGITUDE)
+
+
+wind_data_comp <- wind_data_day %>% 
+  group_by(NAME,LATITUDE,LONGITUDE) %>% 
+  padr::pad(start_val = as.POSIXct("2018-01-01", format="%Y-%m-%d"), end_val = as.POSIXct("2020-12-31", format="%Y-%m-%d")) %>% 
+  padr::fill_by_value(value = NA) %>%
+  filter(!is.na(DATA)) 
+
+dados_data <- wind_data_comp %>%
+  ungroup() %>% 
+  select(-LATITUDE, -LONGITUDE) %>% 
+  pivot_wider(names_from = NAME, values_from = WIND_SPEED_ms_mean) 
+
+dados <- dados_data
+```
+
+
+Para a simulação, é necessária a divisão dos dados em treino e teste, sendo treino aquele conjunto utilizado para a construção do modelo e teste o conjunto utilizado para a comparação dos dados previstos.
+
+```{r}
+#SEPARANDO EM TREINO E TESTE
+
+corte <- dados %>% filter(DATA == as.POSIXct("2019-12-31", format="%Y-%m-%d"))
+
+dados_treino <- dados  %>% dplyr::filter(DATA <= corte$DATA)
+
+dados_teste <- dados %>%  dplyr::filter(DATA > corte$DATA)
+
+dados <- dados_treino %>% select(-DATA)
+```
+
+
+
+Os dados devem estar como matrix: usar as.matrix(dados) para converter:
+
+```{r}
+#Transformando os dados em matriz
+dados.mat <- as.matrix(dados)
+```
+
+
+A matriz dos dados deve ser da forma n x t (linha x coluna) onde t é o comprimento do tempo e n é o número de espaços.
+Caso a matriz esteja na forma t x n, é necessário transpô-la:
+
+```{r}
+#Transpondo a matriz
+tdados.mat <- t(dados.mat)
+```
+
+## Leitura das matrizes W espaciais
+
+As matrizes espaciais são utilizadas para levar em conta a influência de locais próximos. 
+
+```{r}
+coor <- wind_data_day %>% select(LONGITUDE,LATITUDE) %>% distinct()
+SP <- SpatialPoints(coor,proj4string=CRS("+proj=longlat +zone=24"))
+dist.utm <- spTransform(SP, CRS("+init=epsg:32724"))
+M <- as.matrix(1/dist(dist.utm@coords))
+m <- M/rowSums(M)
+W <- list(diag(5),m) #Criando um banco de dados de matrizes espaciais geral
+ 
+```
+
+
+#IDENTIFICAÇÃO DO MODELO
+
+Tendo-se os dados temporais e matrizes espaciais, pode-se começar a construção do modelo. O primeiro passo é a identificação das ordens do modelo (p, lambdak, d, q e mk)
+
+## Ordem d
+
+A ordem d representa a quantidade de diferenciações necessárias para tornar o sistema estacionário.
+
+Assim, inicialmente é necessária a verificação da estacionariedade dos dados. Para verificar a estacionariedade, plota-se os dados originais, para uma verificação inicial visual:
+
+```{r}
+dados.mat.ts <- as.ts(dados.mat,time=1,frequency=1)
+plot(dados.mat.ts, main = "Velocidade do Vento")
+```
+
+Para uma determinação mais exata da ordem de diferenciação necessária, utiliza-se o Teste de Dickey Fuller Aumentado:
+
+```{r}
+#CHECAR SE A SÉRIE É ESTACIONÁRIA
+estacoes <- colnames(dados)
+n_estacoes <- 5
+diferenciacao<-tdados.mat
+ordem_d <- matrix(nrow=n_estacoes,ncol=1)
+
+for (i in 1:n_estacoes){
+  d<-0
+  p <- adf.test(diferenciacao[i,])
+  #print(p)
+  diferente<-diferenciacao[i,]
+  while (p$p.value > 0.05){
+    diferente <-diff(diferente,lag=1,differences=1)
+    d=d+1
+    p <- adf.test(diferente)
+  }
+    ordem_d[i,] <- d #Lista com os valores de d para cada radar
+}
+colnames(ordem_d) <- "d Necessário"
+
+rownames(ordem_d) <- estacoes
+
+print(ordem_d)
+```
+
+Caso a observação dos gráficos anteriores indiquem não-estacionariedade, é necessária a diferenciação.
+Como os dados não são mais apenas um processo temporal, mas sim um conjunto de processos (cada estação representa um processo), a diferenciação deve ser feita igualmente para todos (i.e., a ordem de diferenciação se aplica a todas as estações, até que todos estejam estacionários):
+
+```{r}
+par(cex.main = 0.85) #Tamanho do título
+par(cex.axis = 0.85) #Tamanho do rótulo do eixo
+
+#Ordem de diferenciação a ser aplicada a todos os radares
+d <- max(ordem_d)
+
+#DIFERENCIAÇÃO
+
+if (d > 0){
+  tdados.mat_diferenciados<-matrix(nrow=n_estacoes,ncol=length(tdados.mat[1,])-d)
+
+  for (i in 1:5){
+    tdados.mat_diferenciados[i,]<-diff(tdados.mat[i,],lag=1,differences = d)
+  }
+} else {
+  tdados.mat_diferenciados <- tdados.mat
+}
+
+
+#PLOTAGEM DOS DADOS 
+tdados.mat_diferenciados_ts <- t(tdados.mat_diferenciados)
+tdados.mat_diferenciados_ts <- as.ts(tdados.mat_diferenciados_ts)
+
+
+colnames(tdados.mat_diferenciados_ts) <- estacoes
+
+
+plot(tdados.mat_diferenciados_ts, main="")
+
+```
+
+
+Tendo os dados estacionários, agora retiramos a média (centralização, necessária para a aplicação das funções STACF e STPACF):
+
+```{r}
+#RETIRANDO A MÉDIA
+medias <- matrix(nrow=n_estacoes,ncol=1)
+for (i in 1:n_estacoes){
+    media <- mean(tdados.mat_diferenciados[i,])
+    medias[i,1] <- media
+    tdados.mat_diferenciados[i,]<-tdados.mat_diferenciados[i,]-media
+}
+
+```
+
+Nota-se que é importante armazenar as médias em uma variável, pois serão necessárias ao final.
+
+
+```{r}
+dados_pad <- t(tdados.mat_diferenciados)
+
+#funções do pacote STARMA já que d=0
+stcor.test(dados_pad, W)
+
+stacf(dados_pad, W, use.ggplot = F) #ma 1
+
+stpacf(dados_pad, W, use.ggplot = F) #ar 3
+```
+
+
+## Ordens da Média Móvel - Space-Time Autocorrelation Function (STACF)
+
+A função STACF é a que permite a definição das ordens q (temporal) e m (espacial) da média móvel.
+
+```{r}
+n_vizinhancas <- 2 
+ordens_vizinhanca <- c() #Para cabeçalho das tabelas
+for (i in 1:n_vizinhancas){
+  ordens_vizinhanca[i] <- paste("L",i-1,sep="")
+}
+
+#DEFINIÇÃO DA FUNÇÃO
+st.acf <- function(datamat,wmatrix1=NULL,wmatrix2=NULL,timelag=1,lwmat=FALSE,kwmat=FALSE){
+  if (lwmat==TRUE & kwmat==TRUE){
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for(i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <- sumn + (wmatrix1[i,j])*(datamat[j,t])*(wmatrix2[i,j])*(datamat[j,t+(timelag)])
+        }
+      }
+    }
+    return(sumn/sqrt((sum((wmatrix1%*%datamat)^2))*(sum((wmatrix2%*%datamat)^2))))
+  }
+  else if (lwmat==TRUE & kwmat==FALSE){
+    a=dim(datamat)[1] #n° de radares = N
+    b=dim(datamat)[2] #n° de lags temporais = Tal
+    #Timelag = s
+    sumn <- 0
+    for(i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <- sumn + (wmatrix1[i,j])*(datamat[j,t])*(datamat[i,t+(timelag)]) #Numerador
+        }
+      }
+    }
+    return(sumn/sqrt((sum((wmatrix1%*%datamat)^2))*(sum(datamat^2))))
+    }
+  else if (lwmat==FALSE & kwmat==TRUE){
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    
+    sumn <- 0
+    for (i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <-sumn + (datamat[i,t])*(wmatrix2[i,j])*(datamat[j,t+(timelag)])
+        }
+      }
+    }
+    
+    return(sumn/sqrt((sum((datamat)^2))*(sum(wmatrix2%*%(datamat)^2))))
+    
+  }
+  else{
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for(i in 1:a){
+      for(t in 1:(b-(timelag))){
+        sumn <- sumn + (datamat[i,t])*(datamat[i,t+(timelag)])
+      }
+    }
+    return(sumn/sqrt((sum((datamat)^2))*(sum(datamat^2))))
+    }
+}
+
+#################################
+#APLICAÇÃO DA FUNÇÃO
+timelags_acf <- 25 #Número de timelags de cálculo da função
+
+stacf_table<-matrix(nrow=timelags_acf+1,ncol=n_vizinhancas)
+
+for (i in 0:timelags_acf){
+  for (j in 0:(n_vizinhancas-1)){
+    if (j == 0){
+      stacf_table[i+1,j+1] <- st.acf(tdados.mat_diferenciados,timelag=i) #k=0 e l=0
+    }else{
+      stacf_table[i+1,j+1] <- st.acf(tdados.mat_diferenciados,wmatrix1=W[[j+1]],timelag=i,lwmat=TRUE) #k=0 e l=1, 2 e 3 
+    }
+  }
+}
+
+colnames(stacf_table) <- ordens_vizinhanca
+knitr::kable(stacf_table)
+
+```
+
+## Ordens da Auto Regressão - Space-Time Auto Covariance Function (STACOVF)
+
+A função STACOVF é utilizada na estimação da função STPACF (que por sua vez define as ordens p e lambda da Auto Regressão), por meio do análogo à equação de Yule Walker.
+
+Assim, para cada lag temporal k e ordem espacial l, haverá um sistema diferente de equações a ser resolvido, com os valores de phi como as incógnitas. Para a STPACF, no entanto, apenas os valores de `r phi sub k,l` interessam. 
+
+```{r}
+#DEFINIÇÃO DA FUNÇÃO
+st.acovf <- function(datamat,wmatrix1=NULL,wmatrix2=NULL,timelag=1,lwmat=FALSE,kwmat=FALSE){
+  if (lwmat==TRUE & kwmat==TRUE){
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for(i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <- sumn + (wmatrix1[i,j])*(datamat[j,t])*(wmatrix2[i,j])*(datamat[j,t+(timelag)])
+        }
+      }
+    }
+    return(sumn/(a*(b-(timelag))))
+  }
+  else if (lwmat==TRUE & kwmat==FALSE){
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for(i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <- sumn + (wmatrix1[i,j])*(datamat[j,t])*(datamat[i,t+(timelag)])
+        }
+      }
+    }
+    return(sumn/(a*(b-(timelag))))
+    }
+  else if (lwmat==FALSE & kwmat==TRUE){
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for (i in 1:a){
+      for(j in 1:a){
+        for(t in 1:(b-(timelag))){
+          sumn <-sumn + (datamat[i,t])*(wmatrix2[i,j])*(datamat[j,t+(timelag)])
+        }
+      }
+    }
+    return(sumn/(a*(b-(timelag))))
+  }
+  else{
+    a=dim(datamat)[1]
+    b=dim(datamat)[2]
+    sumn <- 0
+    for(i in 1:a){
+      for(t in 1:(b-(timelag))){
+        sumn <- sumn + (datamat[i,t])*(datamat[i,t+(timelag)])
+      }
+    }
+    return(sumn/(a*(b-(timelag))))
+    #return(sumn/(a*b))
+    }
+}
+#######################################
+#APLICAÇÃO DA FUNÇÃO
+
+timelags_pacf <- 15 #Começar com timelags pequenos, pois trata-se de um processo computacionalmente custoso
+
+stpacf_table <- matrix(nrow=timelags_pacf,ncol=n_vizinhancas)
+
+#Para cada timelag e cada spatial lag da stpacf, deve-se resolver um sistema de Yule Walker diferente:
+
+for (tau in 1:timelags_pacf){
+  for (lambda in 0:(n_vizinhancas-1)){
+    
+    #Lado esquerdo do sistema de equações Yule Walker
+    #Para cada timelag s, deve-se fazer as combinações de k e l, que devem variar de 0 a 2. Note que quando uma das variáveis k ou l for igual a 0, não há a necessidade de colocar a matriz espacial como input (visto que o operador espacial de ordem 0 é uma matriz identidade)
+    Y.mat <- matrix(nrow=tau*(lambda+1),ncol=1)
+    # Para L igual a 0 e K variando de 0 a 3
+    for (i in 1:tau){
+      for (j in 0:(lambda)){
+        if (j == 0){
+          Y.mat[(i-1)*(lambda+1)+1,1] <- st.acovf(tdados.mat_diferenciados,timelag=i)#k=0 e l=0 
+        }else{
+          Y.mat[(i-1)*(lambda+1)+j+1,1] <- st.acovf(tdados.mat_diferenciados,timelag=i,wmatrix1=W[[j+1]],lwmat=TRUE) #k=0 e l= 1, 2 e 3 
+        }
+      }
+    }
+    
+    # Agora montando a matriz A
+    #Inicialmente, montamos as submatrizes
+    submatrizes <- list()
+    for (i in 0:(tau-1)){
+      submat <- matrix(nrow=(lambda+1),ncol=(lambda+1))
+      for (k in 0:(lambda)){
+        for (l in 0:(lambda)){
+          if (k==0 & l==0){
+            submat[k+1,l+1] <- st.acovf(tdados.mat_diferenciados,timelag=i) #k=0 e l=0
+          } else if (k==0){
+            submat[k+1,l+1] <- st.acovf(tdados.mat_diferenciados,timelag=i,wmatrix1=W[[l+1]],lwmat=TRUE) #k=0 e l=1,2,3
+          } else if (l==0){
+            submat[k+1,l+1] <- st.acovf(tdados.mat_diferenciados,timelag=i,wmatrix2=W[[k+1]],kwmat=TRUE) #l=0 e k=1,2,3
+          } else{
+            submat[k+1,l+1] <- st.acovf(tdados.mat_diferenciados,timelag=i,wmatrix1=W[[l+1]],wmatrix2=W[[k+1]],lwmat=TRUE,kwmat=TRUE) #k=1,2,3 e l=1,2,3 
+          }
+        }
+      }
+      submatrizes[[i+1]] <- submat
+    }
+    
+    A.mat <- matrix(nrow=tau*(lambda+1),ncol=tau*(lambda+1))
+    
+    for (i in 0:(tau-1)){
+      for (j in 0:(tau-1)){
+        ind <- abs(i-j)
+        submat <- submatrizes[[ind+1]]
+        for (k in 1:(lambda+1)){
+          for (l in 1:(lambda+1)){
+            A.mat[i*(lambda+1)+k,j*(lambda+1)+l]<-submat[k,l]
+          }
+        }
+      }
+    }
+    
+    #Resolução da equação de Yule Walker, retornando os parâmetros de PACF estimados:
+    A.matinv <- solve(A.mat)
+    Est <- A.matinv%*%Y.mat
+    
+    Est.mat <- matrix(Est,nrow=tau,ncol=(lambda+1),byrow=TRUE)
+    stpacf_table[tau,(lambda+1)] <- Est.mat[tau,(lambda+1)] #PACF pega apenas o último valor da Est.mat, para cada timelag e spatial lag considerado
+  }
+}
+
+colnames(stpacf_table) <- ordens_vizinhanca
+knitr::kable(stpacf_table)
+```
+
+## Plotagem
+
+
+A identificação das ordens do modelo (temporais e espaciais, tanto para AR quanto para MA) são feitas a partir da STACF e STPACF.
+
+O gráfico abaixo representa, para cada timelag, a correlação entre os diferentes pontos espaciais. Assim, para determinado timelag, o valor no gráfico indica quanto cada ponto influência o ponto previsto (incluindo o próprio analisado).
+
+Assim, para definir a ordem temporal basta identificar o último timelag com valor acima do ruído, para a linha de L0. E para a ordem espacial basta identificar quantas (se houver) linhas além da L0 que apresentam valores acima do ruído.
+
+Relembrando que o gráfico da STACF serve para a identificação de q (temporal) e m (espacial), e a STPACF serve para identificar p (temporal) e lambda (espacial).
+
+```{r}
+#STACF - ORDENS DA MA
+par(cex.main = 0.85) #Tamanho do título
+par(cex.axis = 0.95) #Tamanho do título do eixo
+
+stacf_plot <- as.data.frame(abs(stacf_table)) #Transforma em dataframe e calcula o módulo dos valores
+stacf_plot <- rownames_to_column(stacf_plot) #Transforma os index de timelags em uma coluna
+colnames(stacf_plot) = c("Timelag",ordens_vizinhanca) #Nomeia colunas
+stacf_plot <- stacf_plot %>% mutate(Timelag = as.integer(Timelag), Timelag = Timelag-1) #Transforma a 1ª coluna em números inteiros, e renumera a partir do 0
+
+
+cores <- hcl.colors(n_vizinhancas, palette = "viridis", alpha = NULL, rev = FALSE, fixup = TRUE)
+plot(stacf_plot$Timelag,stacf_plot[,2],type="l",col=cores[1],main = "STACF do Processo", xlab = "Timelags", ylab="STACF",ylim=c(0,1))
+for (i in 2:n_vizinhancas){
+  lines(stacf_plot$Timelag,stacf_plot[,i+1],col=cores[i])
+}
+legend(x = 20, y = 1, legend = ordens_vizinhanca, col = cores,lty=1:2, cex=0.95)
+axis(1, seq(0,timelags_acf,1))
+
+#----------------------------------------------
+
+#STPACF - ORDENS DA AR
+stpacf_plot <- as.data.frame(abs(stpacf_table)) #Transforma em dataframe e calcula o módulo dos valores
+stpacf_plot <- rownames_to_column(stpacf_plot) #Transforma os index de timelags em uma coluna
+colnames(stpacf_plot) = c("Timelag",ordens_vizinhanca) #Nomeia colunas
+obs0 <- c(0,1,NA,NA,NA) #Coloca um valor unitário no timelag 0, para melhorar a escala de observação
+stpacf_plot <- rbind(obs0,stpacf_plot)
+
+cores <- hcl.colors(n_vizinhancas, palette = "viridis", alpha = NULL, rev = FALSE, fixup = TRUE)
+plot(stpacf_plot$Timelag,stpacf_plot[,2],type="l",col=cores[1],main = "STPACF do Processo", xlab = "Timelags", ylab="STPACF",ylim=c(0,1))
+for (i in 2:n_vizinhancas){
+  lines(stpacf_plot$Timelag,stpacf_plot[,i+1],col=cores[i])
+}
+legend(x = 4, y = 1, legend = ordens_vizinhanca, col = cores,lty=1:2, cex=0.95)
+axis(1, seq(0,timelags_acf,1))
+```
+
+A partir das funções STACF e STPACF, visualmente indica-se valores possíveis das ordens de p, lambda, q e m do modelo:
+
+```{r}
+p <- as.numeric(readline("Qual a ordem temporal p? (AR) "))
+lambda <- as.numeric(readline("Qual a ordem espacial lambda? (AR) "))
+q <- as.numeric(readline("Qual a ordem temporal q? (MA) "))
+m <- as.numeric(readline("Qual a ordem espacial m? (MA) "))
+
+ordens <- c(p,lambda,q,m)
+```
+
+# ESTIMAÇÃO DOS PARÂMETROS
+
+Determinadas as ordens espaciais e temporais, deve-se agora definir os parâmetros alfas e betas.
+Caso seja um processo STAR, a resolução passa por um sistema linear. No entanto, nos casos de processos STARMA ou STMA, o caso é não linear.
+
+Para resolver a questão, o artigo de ASAAD sugere o uso do algoritmo de Levenberg Marquadt, mas detacamos que existem outros métodos de solução não lineares que podem ser empregados, a critério do usuário.
+
+Para resolver o Levenberg Marquadt, cuja função já existe no R, é necessário o input dos dados temporais, uma estimativa inicial dos parâmetros e uma função a ser estimada (No caso, a chamada RSTARIMA, que calcula o resíduo).
+
+Como output, a função retorna o número de iterações feitas, os parâmetros utilizados em cada iteração e o erro obtido com o uso desses parâmetros.
+
+Sendo assim, inicialmente é necessário definir a função RSTARIMA (que nada mais é que o cálculo do resíduo entre o calculado pelo STARIMA e o ocorrido de fato).
+
+Ao montar a equação STARIMA para as ordens definidas, verifica-se que são necessários os valores das p observações anteriores, e dos q resíduos anteriores para o cálculo.
+
+Sendo assim, para que possamos aplicar o método Levenberg Marquadt é necessário primeiramente obtermos os valores passados dos resíduos - fazer um 'backforecasting'.
+
+No entanto, devido à hipótese de ruído branco para os resíduos, pode-se admitir que esses valores passados são zero, sem grandes prejuízos para o método. A função RSTARIMA abaixo considera que esses valores passados são zero:
+
+```{r}
+#DEFINIÇÃO DA FUNÇÃO RSTARIMA
+
+RSTARIMA <- function(par, datamat, wmatrix, ordens){
+  # Recebe uma lista de parâmetros os dados temporal-espaciais, a lista de matrizes espaciais e a lista de ordens do modelo.
+  # A diferença entre essa função e a STARIMA é que essa calcula já os resíduos, considerando que os primeiros (ou seja, aqueles que precisariam ser calculados por backforecasting) são zero.
+  #datamat no formato n x t
+  
+  #Transformando o vetor de parâmetros em matrix linha
+  par <- matrix(par,nrow=1)
+
+  #Pegando as ordens
+  p <- ordens[1]
+  lambda <- ordens[2]
+  q <- ordens[3]
+  m <- ordens[4]
+  
+  #Criando a matriz de parâmetros a partir do vetor fornecido
+  if (q>0){
+    alfas <- matrix(par[1:((m+1)*q)],ncol=(m+1), nrow=q) #par de 1 a [(m+1) * q]
+    #print(paste("ALFAS: \n",alfas))
+  }
+  if (p>0){
+    betas <- matrix(par[((m+1)*q+1):length(par)],ncol=(lambda+1), nrow=p) #par de [(m+1) * q] até o final - total de lambda+1 * p
+    #print(paste("BETAS: \n",betas))
+  }
+  
+  tmax <- length(datamat[1,]) #Máximo número de timelags no banco de dados
+  n_estacoes <- length(datamat[,1]) #Número de radares do banco de dados
+  
+  residuos <- matrix(0,nrow=n_estacoes, ncol=tmax) #Matriz zerada de n_estacoes x tmax
+  
+  for (t in (1+max(p,q)):tmax){
+    residuos[,t] <- datamat[,t]
+    
+    if (p>0){
+      for (k in 1:p){
+        for (l in 0:lambda){
+          residuos[,t] <- residuos[,t] - betas[k,l+1] * (wmatrix[[l+1]] %*% datamat[,t-k])
+        }
+      }
+    }
+    
+    if (q>0){
+      for (k in 1:q){
+        for (l in 0:m){
+          residuos[,t] <- residuos[,t] + alfas[k,l+1] * (wmatrix[[l+1]] %*% residuos[,t-k])
+        }
+      }
+    }
+  }
+  
+  residuos <- as.vector(residuos)
+  return (residuos)
+}
+
+```
+
+Tendo a função, podemos seguir para a estimação.
+De acordo com os valores de p, lambda, q e m, sabemos quantos parâmetros alfa e beta devem ser estimados (da equação do STARIMA):
+Nbeta = (lambda+1) * p
+Nalfa = (m+1) * q
+
+A estimação dos parâmetros segue um processo iterativo de cálculo, que varia os parâmetros alfas e betas, jogando-os na função STARIMA e buscando minimizar o resíduo.
+
+Como se trata de um processo iterativo, é necessário um chute inicial dos parâmetros, que pega valores pico das funções STACF e STPACF:
+
+```{r}
+# CHUTES INICIAIS DE ALFAS E BETAS
+
+#O chute inicial dos coeficientes autorregressivos vem dos resultados da função STPACF: os maiores valores em módulo
+if (p>0){
+  #Lista de parâmetros autoregressivos
+  #Criando uma cópia da stpacf_table 
+  stpacf_abs_table <- matrix(0, nrow=dim(stpacf_table)[1], ncol=dim(stpacf_table)[2])
+  stpacf_abs_table <- stpacf_table 
+  
+  #ordenando cada coluna de acordo com os valores significantes e transformando em matrix
+  b <- matrix(0,nrow=dim(stpacf_table)[1], ncol=dim(stpacf_table)[2])
+  
+  for (i in 1:dim(stpacf_table)[2]){
+    b[,i] <- stpacf_abs_table[,i][order(-abs(stpacf_abs_table[,i]))] #Pega os valores e ordena cada coluna de acordo com o maior valor em módulo
+  }
+  
+  betas <- matrix(ncol=(lambda+1), nrow=p)
+  #Retira somente o número de parâmetros necessários, após ser reoordenado
+  for (i in 1:p){
+    for (j in 1:(lambda+1)){
+     betas[i,j] <- b[i,j]
+    }
+  }
+  par_betas <- matrix(betas,nrow=1)
+} else {
+    par_betas <- NULL
+}
+
+#O chute inicial dos coeficientes de médias móveis vem dos resultados da função STACF: os maiores valores em módulo
+if (q>0){
+  #Lista de parâmetros de média móvel
+  #Criando uma cópia da stpacf_table
+  stacf_abs_table <- matrix(0, nrow=dim(stacf_table)[1]*dim(stacf_table)[2],ncol=1)
+  stacf_abs_table <- stacf_table 
+  
+  #ordenando de acordo com os valores significantes e transformando em matrix
+  c <- matrix(0,nrow=dim(stacf_table)[1], ncol=dim(stacf_table)[2])
+  stacf_abs_table[1,1] <- 0
+  
+  for (i in 1:dim(stacf_table)[2]){
+    c[,i] <- stacf_abs_table[,i][order(-abs(stacf_abs_table[,i]))] #Pega os valores e ordena cada coluna de acordo com o maior valor em módulo
+  }
+  
+ alfas <- matrix(ncol=(m+1), nrow=q)
+ #Retira somente o número de parâmetros necessários, após ser reoordenado
+  for (i in 1:q){
+    for (j in 1:(m+1)){
+      alfas[i,j] <- c[i,j]
+    }
+  }
+  
+  par_alfas <- matrix(alfas,nrow=1)
+} else {
+  par_alfas <- NULL
+}
+
+par <- cbind(par_alfas,par_betas)
+par <- as.vector(par)
+par <- abs(par)
+par
+```
+
+É importante notar que não se utiliza o primeiro valor da STACF, que é sempre unitário, pois esse chute inicial pode causar uma divergência do processo de estimação.
+
+Tendo os valores das observações, a função que calcula os resíduos passados e o chute inicial dos parâmetros, pode-se finalmente aplicar a função de Levenberg Marquadt:
+
+```{r}
+nls.out <- nls.lm(fn = RSTARIMA,par=par,datamat = tdados.mat_diferenciados, wmatrix=W, ordens=ordens,control=nls.lm.control(nprint=1,maxiter=200)) #nprint=1 indica que a função vai imprimir os resultados a cada iteração
+
+#Parâmetros estimados por Levenberg:
+par_est <- nls.out$par
+par_est <- matrix(par_est,nrow=1)
+
+```
+
+# CALIBRAÇÃO DO MODELO
+
+Segue-se então para a calibração do modelo, que consiste em utilizar a construção feita até aqui (determinação das ordens e parâmetros) e aplicar aos dados de treino, verificando os resíduos.
+Serão utilizados neste trabalho os seguintes indicadores de acurácia para a calibração do modelo:
+
+```{r}
+#DEFINIÇÃO DA FUNÇÃO QUE CALCULA OS COEFICIENTES DE ACURÁCIA
+coef_acur <- function(observado,residuo,stacf_res){
+  
+  boxpierce <- length(stacf_res) * sum(stacf_res^2)
+  
+  rss <- sum(residuo^2)
+  efic <- 1-(rss/sum((observado - mean(observado))^2))
+  mae <- sum(abs(residuo))/length(residuo)
+  
+  coef <- matrix(c("E","RSS","MAE","Box-Pierce",efic,rss,mae,boxpierce),nrow=2,ncol=4,byrow=TRUE)
+  return(coef)
+}
+
+```
+
+Tendo-se a função, parte-se para sua aplicação aos dados de treino. No entanto, para ela é necessária a definição da função de Integração, que desfaz a centralização e diferenciação feitas nos dados:
+
+```{r}
+Integracao <- function(datamat, previsao, medias, n_diff){
+  #Recebe os dados originais (antes da diferenciação e da retirada da média), os dados previstos pela STARIMA, uma lista com as médias, e o número de diferenciações realizadas
+  #datamat e previsao no formato n x t
+  
+  tmax_prev <- length(previsao[1,]) #Máximo número de timelags na previsão
+  tmax_data <- length(datamat[1,]) #Máximo número de timelags nos dados originais
+  n_estacoes <- length(datamat[,1]) #Número de radares do banco de dados
+  
+  #Adição das médias retiradas
+  for (i in 1:n_estacoes){
+    previsao[i,] <- previsao[i,] + medias[i,]
+  }
+  
+  #MUDEI
+  
+  #Integração
+  if (n_diff > 0){
+    for (i in 1:n_diff){
+      
+      #Diferenciando d-1 vezes
+      if (i < n_diff){
+        datamat_diff <- matrix(nrow=n_estacoes,ncol=tmax_data-(n_diff-i))
+        for (k in 1:n_estacoes){
+            datamat_diff[k,]<-diff(datamat[k,],lag=1,differences = (n_diff-i))
+        }
+      } else {
+        datamat_diff <- datamat
+      }
+      tmax_data_diff <- length(datamat_diff[1,])
+      
+      #Integrando o incremento
+      for (j in 1:tmax_prev){
+        if (j == 1){
+          previsao[,j] <- datamat_diff[,tmax_data_diff] + previsao[,j]
+        } else {
+          previsao[,j] <- previsao[,j] + previsao[,j-1]
+        }
+      }
+    }
+  }
+  
+  return(previsao)
+}
+```
+
+Enfim, pode-se realizar o cálculo dos índices de acurácia:
+
+```{r}
+#Calibração com dados integrados
+lags_cal <- (max(p,q)+d)
+#Resíduos para calibração diferenciados
+residuos_cal_diff <- matrix(RSTARIMA(par=par_est,datamat=tdados.mat_diferenciados,wmatrix=W,ordens=ordens),nrow=n_estacoes)
+
+#Previsao dos dados de treino
+previsao_cal_diff <- tdados.mat_diferenciados - residuos_cal_diff
+
+previsao_cal <- matrix(nrow=n_estacoes,ncol=length(tdados.mat[1,]))
+for (i in 1:(max(p,q)+d)){
+  previsao_cal[,i] <- tdados.mat[,i]
+}
+
+for (i in ((max(p,q)+d)+1):length(tdados.mat[1,])){
+  datamat_coluna <- matrix(tdados.mat[,1:(i-1)],nrow=n_estacoes)
+  prev_coluna <- matrix(previsao_cal_diff[,(i-d)],ncol=1)
+  previsao_cal[,i] <- Integracao(datamat=datamat_coluna,previsao=prev_coluna,medias=medias,n_diff=d)
+}
+
+#Resíduos para calibração integrados
+residuos_cal <- tdados.mat - previsao_cal
+residuos_cal <- residuos_cal[,(lags_cal+1):length(residuos_cal[1,])]
+
+#Obserações para calibração integrados
+observado_cal <- tdados.mat[,(lags_cal+1):length(tdados.mat[1,])]
+
+###########################
+#Cálculo da STACF dos resíduos
+timelags_acf_res <- 25 #Número de timelags de cálculo da função
+
+stacf_res_table<-matrix(nrow=timelags_acf_res+1,ncol=n_vizinhancas)
+
+for (i in 0:timelags_acf_res){
+  for (j in 0:(n_vizinhancas-1)){
+    if (j == 0){
+      stacf_res_table[i+1,j+1] <- st.acf(residuos_cal,timelag=i) #k=0 e l=0
+    }else{
+      stacf_res_table[i+1,j+1] <- st.acf(residuos_cal,wmatrix1=W[[j+1]],timelag=i,lwmat=TRUE) #k=0 e l=1, 2 e 3 
+    }
+  }
+}
+
+stacf_res_table <- as.vector(stacf_res_table)
+stacf_res_table <- stacf_res_table[2:length(stacf_res_table)] #Excluindo o valor unitario da STACF
+############################
+
+#Cálculo dos Indicadores de Acurácia
+
+acuracia <- coef_acur(observado = observado_cal,residuo = residuos_cal,stacf_res = stacf_res_table)
+acuracia <- as.data.frame(acuracia)
+colnames(acuracia) <- acuracia[1,]
+acuracia <- acuracia[-1,]
+rownames(acuracia) <- NULL
+
+for (i in 1:4){
+  acuracia[1,i] <- formatC(as.numeric(acuracia[1,i]),digits=3,format="e")
+}
+
+print(acuracia)
+```
+
+
+É necessária a execução desse passo algumas vezes, para todas as ordens possíveis indicadas pela STACF e STPACF, anotando-se os indicadores de acurácia, e por fim escolhendo o modelo que apresente o melhor resultado para esses indicadores.
+
+Assim, o passo a passo é:
+ - Rodar até aqui uma vez, observar os valores dos indicadores de acurácia;
+ - Voltar à linha 622 e verificar quais os valores máximos das ordens, com base no observado no gráfico;
+ - Rodar o bloco abaixo com esses valores máximos, resultando na impressão de todas as combinações de ordens e os indicadores de acurácia respectivos;
+ - Escolher da tabela qual a melhor combinação de ordens do modelo, e voltar à linha 622 para colocar essas ordens como definitivas, então a linha 718 para chutar parâmetros iniciais e por fim a linha 784 para definir os parâmetros alfas e betas, estando assim o modelo completo, podendo-se pular essa parte da calibração e seguir para a validação.
+
+```{r, echo=FALSE}
+
+p_cal <- as.integer(readline("Qual o máximo valor de p? "))
+lambda_cal <- as.integer(readline("Qual o máximo valor de lambda? "))
+q_cal <- as.integer(readline("Qual o máximo valor de q? "))
+m_cal <- as.integer(readline("Qual o máximo valor de m? "))
+
+
+#Lista de parâmetros autoregressivos
+stpacf_abs_table <- matrix(0, nrow=dim(stpacf_table)[1], ncol=dim(stpacf_table)[2])
+stpacf_abs_table <- stpacf_table
+b <- matrix(0,nrow=dim(stpacf_table)[1], ncol=dim(stpacf_table)[2])
+for (i in 1:dim(stpacf_table)[2]){
+  b[,i] <- stpacf_abs_table[,i][order(-abs(stpacf_abs_table[,i]))] #Pega os valores e ordena cada coluna de acordo com o maior valor em módulo
+}
+
+#Lista de parâmetros de média móvel
+stacf_abs_table <- matrix(0, nrow=dim(stacf_table)[1]*dim(stacf_table)[2],ncol=1)
+stacf_abs_table <- stacf_table
+c <- matrix(0,nrow=dim(stacf_table)[1], ncol=dim(stacf_table)[2])
+stacf_abs_table[1,1] <- 0
+
+for (i in 1:dim(stacf_table)[2]){
+  c[,i] <- stacf_abs_table[,i][order(-abs(stacf_abs_table[,i]))] #Pega os valores e ordena cada coluna de acordo com o maior valor em módulo
+}
+
+#Loop para rodar todas as combinações possíveis de ordens e calcular os indicadores de acurácia
+tabela_acuracia <- matrix(c("p","lambda","q","m","E","RSS","MAE","Box","h"),nrow=1, ncol=9)
+
+for (ii in 0:p_cal){
+  for (jj in 0:lambda_cal){
+    for(kk in 0:q_cal){
+      for (ll in 0:m_cal){
+        if (ii == 0 & kk == 0){
+
+        } else {
+          ordens_cal <- c(ii,jj,kk,ll)
+
+          #Chute inicial dos coeficientes autorregressivos
+          if (ii>0){
+            betas <- matrix(ncol=(jj+1), nrow=ii)
+            for (i in 1:ii){
+              for (j in 1:(jj+1)){
+               betas[i,j] <- b[i,j]
+              }
+            }
+            par_betas <- matrix(betas,nrow=1)
+          } else {
+              par_betas <- NULL
+          }
+
+          #Chute inicial dos coeficientes de médias móveis
+          if (kk>0){
+            alfas <- matrix(ncol=(ll+1), nrow=kk)
+            #Retira somente o número de parâmetros necessários, após ser reoordenado
+            for (i in 1:kk){
+              for (j in 1:(ll+1)){
+                alfas[i,j] <- c[i,j]
+              }
+            }
+            par_alfas <- matrix(alfas,nrow=1)
+          } else {
+            par_alfas <- NULL
+          }
+
+          par <- cbind(par_alfas,par_betas)
+          par <- as.vector(par)
+          par <- abs(par)
+          #####
+          #Estimação dos parâmetros por Levenberg:
+          nls.out <- nls.lm(fn = RSTARIMA,par=par,datamat = tdados.mat_diferenciados, wmatrix=W, ordens=ordens_cal)
+          par_est <- nls.out$par
+          par_est <- matrix(par_est,nrow=1)
+
+          #####
+          lags_cal <- max(ordens_cal[1],ordens_cal[3]) + d
+          
+          #Resíduos para calibração diferenciados
+          residuos_cal_diff <- matrix(RSTARIMA(par=par_est,datamat=tdados.mat_diferenciados,wmatrix=W,ordens=ordens_cal),nrow=n_estacoes)
+          
+          #Previsao dos dados de treino
+          previsao_cal_diff <- tdados.mat_diferenciados - residuos_cal_diff
+          
+          previsao_cal <- matrix(nrow=n_estacoes,ncol=length(tdados.mat[1,]))
+          for (i in 1:lags_cal){
+            previsao_cal[,i] <- tdados.mat[,i]
+          }
+          
+          for (i in (lags_cal+1):length(tdados.mat[1,])){
+            datamat_coluna <- matrix(tdados.mat[,1:(i-1)],nrow=n_estacoes)
+            prev_coluna <- matrix(previsao_cal_diff[,(i-d)],ncol=1)
+            previsao_cal[,i] <- Integracao(datamat=datamat_coluna,previsao=prev_coluna,medias=medias,n_diff=d)
+          }
+          
+          #Resíduos para calibração integrados
+          residuos_cal <- tdados.mat - previsao_cal
+          residuos_cal <- residuos_cal[,(lags_cal+1):length(residuos_cal[1,])]
+          
+          #Obserações para calibração integrados
+          observado_cal <- tdados.mat[,(lags_cal+1):length(tdados.mat[1,])]
+
+          ###########################
+          #Cálculo da STACF dos resíduos
+          timelags_acf_res <- 25 #Número de timelags de cálculo da função
+
+          stacf_res_table<-matrix(nrow=timelags_acf_res+1,ncol=n_vizinhancas)
+
+          for (i in 0:timelags_acf_res){
+            for (j in 0:(n_vizinhancas-1)){
+              if (j == 0){
+                stacf_res_table[i+1,j+1] <- st.acf(residuos_cal,timelag=i) #k=0 e l=0
+              }else{
+                stacf_res_table[i+1,j+1] <- st.acf(residuos_cal,wmatrix1=W[[j+1]],timelag=i,lwmat=TRUE) #k=0 e l=1, 2 e 3
+              }
+            }
+          }
+
+          stacf_res_table <- as.vector(stacf_res_table)
+          stacf_res_table <- stacf_res_table[2:length(stacf_res_table)] #Excluindo o valor unitario da STACF
+          ############################
+
+          #Cálculo dos Indicadores de Acurácia
+
+          acuracia <- coef_acur(observado = observado_cal,residuo = residuos_cal,stacf_res = stacf_res_table)
+          acuracia <- as.data.frame(acuracia)
+          colnames(acuracia) <- acuracia[1,]
+          acuracia <- acuracia[-1,]
+          rownames(acuracia) <- NULL
+
+          for (i in 1:4){
+            acuracia[1,i] <- formatC(as.numeric(acuracia[1,i]),digits=3,format="e")
+          }
+
+          h <- 25-(ii*(jj+1))-(kk*(ll+1))
+          acuracia <- matrix(c(ii,jj,kk,ll,acuracia[1,1:4],h),nrow=1)
+          tabela_acuracia <- rbind(tabela_acuracia,acuracia)
+        }
+      }
+    }
+  }
+}
+
+tabela_acuracia <- as.data.frame(tabela_acuracia)
+
+#Ordenando as colunas
+if (length(tabela_acuracia[,1]) > 1){
+  tabela_acuracia_ord <- tabela_acuracia[-1,]
+  for (i in 5:7){
+    tabela_acuracia_ord[,i] <- as.numeric(tabela_acuracia_ord[,i])
+  }
+
+  tabela_acuracia_ord <- tabela_acuracia_ord[
+    order(-tabela_acuracia_ord[,5], tabela_acuracia_ord[,6], tabela_acuracia_ord[,7] ),
+  ]
+
+  tabela_acuracia <- tabela_acuracia_ord
+  colnames(tabela_acuracia) <- c("p","lambda","q","m","E","RSS","MAE","Box","h")
+  rownames(tabela_acuracia) <- NULL
+}
+
+print(as.matrix(tabela_acuracia))
+```
+Note que:
+ - O valor de E adequado é entre 0 e 1, sendo que quando for <0, o modelo está muito ruim, quando foi = 0 o modelo é equivalente a simplemente realizar a média, e quando foi =1, o modelo é perfeito;
+ - Os valores de RSS e MAE devem ser minimizados;
+ - E o valor de Box-Pierce serve como desempate entre os modelos. Seu valor deve ser localizado em uma tabela Chi-Quadrado.
+
+Escolhido o modelo, parte-se para a simulação.
+
+```{r}
+qchisq(p=.95, df=20)
+```
+
+
+# VALIDAÇÃO DO MODELO (SIMULAÇÃO)
+
+Inicialmente, é necessária a definição de uma nova função, STARIMA, que aplica a equação do método, recalculando resíduos a cada timelag calculado:
+
+```{r}
+#DEFINIÇÃO DA FUNÇÃO STARIMA
+
+STARIMA <- function(par, datamat, wmatrix, ordens, residuos, timelags_fut){
+  # Recebe os parâmetros estimados, os dados temporal-espaciais, a lista de matrizes espaciais, as ordens espaciais e temporais (p, lambda, q e m), uma matriz de resíduos calculada pela RSTARIMA, o número de timelags futuros a serem previstos, uma lista das médias retiradas dos dados e o número de diferenciações feitas.
+  #datamat e residuos no formato n x t
+
+  #Pegando as ordens
+  p <- ordens[1]
+  lambda <- ordens[2]
+  q <- ordens[3]
+  m <- ordens[4]
+  
+  #Criando a matriz de parâmetros a partir do vetor fornecido
+  alfas <- matrix(par[1:((m+1)*q)],ncol=(m+1), nrow=q) #par de 1 a [(m+1) * q]
+  betas <- matrix(par[((m+1)*q+1):length(par)],ncol=(lambda+1), nrow=p) #par de [(m+1) * q] até o final - total de lambda+1 * p
+  
+  n_estacoes <- length(datamat[,1]) #Número de radares do banco de dados
+  
+  y <- matrix(0,nrow=n_estacoes, ncol=timelags_fut)
+
+  for (t in 1:timelags_fut){
+    tmax <- length(datamat[1,]) #Máximo número de timelags no banco de dados
+    
+    if (p>0){
+      for (k in 1:p){
+        for (l in 0:lambda){
+          y[,t] <- y[,t] + betas[k,l+1] * (wmatrix[[l+1]] %*% datamat[,tmax-k+1])
+        }
+      }
+    }
+    
+    if (q>0){
+      for (k in 1:q){
+        for (l in 0:m){
+          y[,t] <- y[,t] - alfas[k,l+1] * (wmatrix[[l+1]] %*% residuos[,tmax-k+1])
+        }
+      }
+    }
+    
+    #Adicionando o valor previsto ao conjunto de dados, para a previsão dos seguintes
+    y_t <- t(y[,t])
+    datamat_t <- t(datamat)
+    datamat_t <- rbind(datamat_t,y_t)
+    datamat <- t(datamat_t)
+    
+    #Cálculo do resíduo do valor previsto
+    y_res <- y[,t]
+    if (p>0){
+      for (k in 1:p){
+        for (l in 0:lambda){
+          y_res <- y_res - betas[k,l+1] * (wmatrix[[l+1]] %*% datamat[,tmax-k+1])
+        }
+      }
+    }
+    
+    if (q>0){
+      for (k in 1:q){
+        for (l in 0:m){
+          y_res <- y_res + alfas[k,l+1] * (wmatrix[[l+1]] %*% residuos[,tmax-k+1])
+        }
+      }
+    }
+    
+    #Adicionando o resíduo do valor previsto ao conjunto de resíduos, para a previsão dos seguintes
+    y_res_t <- t(y_res)
+    residuo_t <- t(residuos)
+    residuo_t <- rbind(residuo_t,y_res_t)
+    residuos <- t(residuo_t)
+  }
+  
+  return (y)
+}
+
+```
+
+
+Como anteriormente os dados foram diferenciados e tiveram a média retirada, o método só está completo após desfazer esses procedimentos. Isso é feito com a função Integracao, definida anteriormente.
+
+
+Com o modelo construído e calibrado, e definidas as funções que realizam a previsão (STARIMA e Integração), parte-se para a simulação:
+
+```{r}
+
+#Cálculo dos resíduos usados na STARIMA
+residuos <- matrix(RSTARIMA(par=par_est,datamat=tdados.mat_diferenciados,wmatrix=W,ordens=ordens),nrow=n_estacoes)
+
+
+#Número de steps a frente do dia escolhido, para a previsão
+steps <- 7
+
+#Aplicação da STARIMA para previsão
+previsao <- STARIMA(par=par_est, datamat=tdados.mat_diferenciados, wmatrix=W, ordens=ordens, residuos=residuos, timelags_fut=steps)
+
+#Integração dos dados
+previsao <- Integracao(datamat=tdados.mat,previsao=previsao,media=medias, n_diff=max(ordem_d))
+
+#Intervalo de confianca
+confianca <- as.integer(readline("Qual o valor da confiança? (50,55,60,65,70,75,80,85,90,95,96,97,98,99) "))
+val_confianca <- c(50,55,60,65,70,75,80,85,90,95,96,97,98,99)
+mult <- c(0.67,0.76,0.84,0.93,1.04,1.15,1.28,1.44,1.64,1.96,2.05,2.17,2.33,2.58)
+z <- mult[grep(confianca,val_confianca)]
+
+desv_pad <- matrix(nrow=n_estacoes,ncol=steps)
+for (i in 1:n_estacoes){
+  for (j in 1:steps){
+    desv_pad[i,j] <- sd(residuos[i,])*(j)^0.5
+  }
+}
+
+upper <- matrix(nrow=n_estacoes,ncol=steps)
+lower <- matrix(nrow=n_estacoes,ncol=steps)
+for(i in 1:steps){
+  upper[,i] <- z*desv_pad[,i]
+  lower[,i] <- -z*desv_pad[,i]
+}
+```
+
+```{r}
+t(previsao)
+```
+
+
+Outra opção de previsão é a previsão step by step, isto é, realimentar o banco de dados com dados reais a cada previsão de um timelag. Isso pode ser feito da seguinte forma:
+
+```{r}
+#Aplicação da STARIMA para previsão step by step (sbs)
+
+treino_sbs <- t(as.matrix(dados_treino %>% select(-DATA)))
+teste_sbs <- t(as.matrix(dados_teste %>% select(-DATA)))
+
+previsao_sbs <- matrix(nrow=n_estacoes,ncol=steps)
+
+medias <- matrix(nrow=n_estacoes,ncol=1)
+
+for (i in 1:steps){#Cálculo a cada step
+  #Diferenciação
+  if (d > 0){
+    treino_sbs_diff<-matrix(nrow=n_estacoes,ncol=(length(treino_sbs[1,])-d))
+    for (k in 1:n_vizinhancas){
+      treino_sbs_diff[k,]<-diff(treino_sbs[k,],lag=1,differences=d)
+    }
+  } else {
+    treino_sbs_diff <- treino_sbs
+  }
+  
+  #Centralização 
+  for (j in 1:n_estacoes){
+    media <- mean(treino_sbs_diff[j,])
+    medias[j,1] <- media
+    treino_sbs_diff[j,] <- treino_sbs_diff[j,] - medias[j,]
+  }
+  
+  #Cálculo dos resíduos usados na STARIMA
+  residuos_sbs <- matrix(RSTARIMA(par=par_est,datamat=treino_sbs_diff,wmatrix=W,ordens=ordens),nrow=n_estacoes) #Cálculo dos resíduos
+  
+  previsao_sbs_1 <- STARIMA(par=par_est, datamat=treino_sbs_diff, wmatrix=W, ordens=ordens, residuos=residuos_sbs, timelags_fut=1) #Previsão de 1 step
+  
+  #Integração da previsão de 1 timelag
+  previsao_sbs_1 <- Integracao(datamat=treino_sbs,previsao=previsao_sbs_1, media=medias, n_diff = d)
+  previsao_sbs[,i] <- t(previsao_sbs_1) #Armazenando a previsão na tabela
+  
+  #Juntando o comportamento de 1 timelag aos dados de treino_sbs
+  treino_sbs <- as.data.frame(treino_sbs)
+  treino_sbs <- rownames_to_column(treino_sbs,var="Radar")
+  comp_sbs <- as.data.frame(teste_sbs[,i])
+  comp_sbs <- rownames_to_column(comp_sbs,var="Radar")
+  treino_sbs <- join(treino_sbs,comp_sbs,by="Radar")
+  treino_sbs <- column_to_rownames(treino_sbs,var="Radar")
+  colnames(treino_sbs) <- NULL
+  treino_sbs <- as.matrix(treino_sbs)
+  
+}
+
+#Cálculo do intervalo de confiança
+
+desv_pad_sbs <- matrix(nrow=n_estacoes,ncol=1)
+for (i in 1:n_estacoes){
+  desv_pad_sbs[i,] <- sd(residuos_sbs[i,])
+}
+
+upper_sbs <- matrix(nrow=n_estacoes,ncol=steps)
+lower_sbs <- matrix(nrow=n_estacoes,ncol=steps)
+for(i in 1:steps){
+  upper_sbs[,i] <- z*desv_pad_sbs
+  lower_sbs[,i] <- -z*desv_pad_sbs
+}
+
+```
+
+
+Plotagem das duas previsões juntas:
+
+```{r}
+#Necessário um tratamento dos dados para a plotagem:
+
+#OBSERVAÇÕES PASSADAS
+observacao_t <- (dados_treino %>% select(-DATA))
+
+#COMPORTAMENTO FUTURO
+comportamento_plot <- dados_teste %>% select(-DATA)
+comportamento_plot <- as.matrix(comportamento_plot[1:as.integer(steps),])
+comportamento_plot <- rbind(observacao_t,comportamento_plot)
+comportamento_plot <- as.data.frame(as.matrix(comportamento_plot))
+
+#PREVISÃO NORMAL
+#Transpondo os Dados da Previsão Normal
+previsao_t <- t(previsao)
+
+colnames(previsao_t) <- estacoes
+
+
+#Juntando dados de previsão aos dados observados no passado:
+previsao_plot <- rbind(observacao_t,previsao_t)
+previsao_plot <- as.data.frame(as.matrix(previsao_plot))
+
+#Intervalo de confiança normal
+upper_t <- t(upper)
+lower_t <- t(lower)
+
+lower_plot <- matrix(0,nrow=length(previsao_plot[,1]),ncol=n_estacoes)
+j <- 1
+for(i in (length(previsao_plot[,1])-steps+1):length(previsao_plot[,1])){
+  lower_plot[i,] <- lower_t[j,]
+  j <- j+1
+}
+for(i in 1:n_estacoes){
+  lower_plot[,i] <- lower_plot[,i] + previsao_plot[,i]
+}
+lower_plot <- as.data.frame(lower_plot)
+
+upper_plot <- matrix(0,nrow=length(previsao_plot[,1]),ncol=n_estacoes)
+j <- 1
+for(i in (length(previsao_plot[,1])-steps+1):length(previsao_plot[,1])){
+  upper_plot[i,] <- upper_t[j,]
+  j <- j+1
+}
+for(i in 1:n_estacoes){
+  upper_plot[,i] <- upper_plot[,i] + previsao_plot[,i]
+}
+upper_plot <- as.data.frame(upper_plot)
+
+#PREVISÃO STEP BY STEP
+#Transpondo os Dados da Previsão Step by Step
+previsao_sbs_t <- t(previsao_sbs)
+
+
+colnames(previsao_sbs_t) <- estacoes
+
+#Juntando dados de previsão aos dados observados no passado
+previsao_sbs_plot <- rbind(observacao_t,previsao_sbs_t)
+previsao_sbs_plot <- as.data.frame(as.matrix(previsao_sbs_plot))
+
+#Intervalo de confiança step by step
+upper_sbs_t <- t(upper_sbs)
+lower_sbs_t <- t(lower_sbs)
+
+lower_sbs_plot <- matrix(0,nrow=length(previsao_sbs_plot[,1]),ncol=n_estacoes)
+j <- 1
+for(i in (length(previsao_sbs_plot[,1])-steps+1):length(previsao_sbs_plot[,1])){
+  lower_sbs_plot[i,] <- lower_sbs_t[j,]
+  j <- j+1
+}
+for(i in 1:n_estacoes){
+  lower_sbs_plot[,i] <- lower_sbs_plot[,i] + previsao_sbs_plot[,i]
+}
+lower_sbs_plot <- as.data.frame(lower_sbs_plot)
+
+upper_sbs_plot <- matrix(0,nrow=length(previsao_sbs_plot[,1]),ncol=n_estacoes)
+j <- 1
+for(i in (length(previsao_sbs_plot[,1])-steps+1):length(previsao_sbs_plot[,1])){
+  upper_sbs_plot[i,] <- upper_sbs_t[j,]
+  j <- j+1
+}
+for(i in 1:n_estacoes){
+  upper_sbs_plot[,i] <- upper_sbs_plot[,i] + previsao_sbs_plot[,i]
+}
+upper_sbs_plot <- as.data.frame(upper_sbs_plot)
+
+
+#Cabeçalhos para os dados conjuntos
+cabecalho_prev <- c()
+cabecalho_comp <- c()
+cabecalho_prev_sbs <- c()
+cabecalho_upper_sbs <- c()
+cabecalho_lower_sbs <- c()
+cabecalho_upper <- c()
+cabecalho_lower <- c()
+for (i in 1:n_estacoes){
+    cabecalho_prev[i] <- paste(estacoes[i],"Previsão",sep = "-")
+    cabecalho_comp[i] <- paste(estacoes[i],"Comportamento",sep = "-")
+    cabecalho_prev_sbs[i] <- paste(estacoes[i],"PrevisãoSBS",sep = "-")
+    cabecalho_upper_sbs[i] <- paste(estacoes[i],"UpperSBS",sep = "-")
+    cabecalho_lower_sbs[i] <- paste(estacoes[i],"LowerSBS",sep = "-")
+    cabecalho_upper[i] <- paste(estacoes[i],"Upper",sep = "-")
+    cabecalho_lower[i] <- paste(estacoes[i],"Lower",sep = "-")
+
+}
+
+colnames(comportamento_plot) <- cabecalho_comp
+comportamento_plot <- rownames_to_column(comportamento_plot,var="Timelags")
+colnames(previsao_plot) <- cabecalho_prev
+previsao_plot <- rownames_to_column(previsao_plot,var="Timelags")
+colnames(previsao_sbs_plot) <- cabecalho_prev_sbs
+previsao_sbs_plot <- rownames_to_column(previsao_sbs_plot,var="Timelags")
+
+colnames(lower_sbs_plot) <- cabecalho_upper_sbs
+lower_sbs_plot <- rownames_to_column(lower_sbs_plot,var="Timelags")
+colnames(upper_sbs_plot) <- cabecalho_lower_sbs
+upper_sbs_plot <- rownames_to_column(upper_sbs_plot,var="Timelags")
+
+colnames(lower_plot) <- cabecalho_upper
+lower_plot <- rownames_to_column(lower_plot,var="Timelags")
+colnames(upper_plot) <- cabecalho_lower
+upper_plot <- rownames_to_column(upper_plot,var="Timelags")
+
+#Títulos
+
+radar_prev <- estacoes
+
+
+# Junção de Todos os Dados para Plotagem
+dados_plotagem <- join(comportamento_plot,previsao_plot, by="Timelags")
+dados_plotagem <- join(dados_plotagem,previsao_sbs_plot, by="Timelags")
+dados_plotagem <- join(dados_plotagem,upper_sbs_plot, by="Timelags")
+dados_plotagem <- join(dados_plotagem,lower_sbs_plot, by="Timelags")
+dados_plotagem <- join(dados_plotagem,upper_plot, by="Timelags")
+dados_plotagem <- join(dados_plotagem,lower_plot, by="Timelags")
+
+dados_plotagem <- dados_plotagem %>% mutate(Timelags = as.integer(Timelags))
+
+dados_plotagem <- dados_plotagem[(length(dados_plotagem[,1])-steps*3):length(dados_plotagem[,1]),]
+
+#PLOTAGEM
+
+#USAR O CÓDIGO ABAIXO CASO NÃO PRECISE DA STEP BY STEP COM ATUALIZAÇÃO DOS PARÃMETROS
+
+for (i in 1:n_estacoes){
+  grafico_comp <- ggplot(data=dados_plotagem,aes(x=Timelags)) + labs(title=paste("Estação", radar_prev[i], "- STARIMA(p=",p,",lambda=",lambda,",d=",d,",q=",q,",m=",m,")"), x="Timelags", y="Velocidade do Vento") +
+    # geom_ribbon(aes(ymax=dados_plotagem[,i+1+n_estacoes*5],ymin=dados_plotagem[,i+1+n_estacoes*6],fill="Intervalo"),fill="salmon",alpha=0.2) +
+    geom_ribbon(aes(ymin=dados_plotagem[,i+1+n_estacoes*3],ymax=dados_plotagem[,i+1+n_estacoes*4],fill="Intervalo"),fill="seagreen",alpha=0.2) +
+    geom_line(aes(y = dados_plotagem[,i+1+2*n_estacoes],group=1,color="Previsão Step by Step"),lwd=1.05) + 
+    # geom_line(aes(y = dados_plotagem[,i+1+n_estacoes],group=1,color="Previsão Normal"),lwd=1.05) +
+    geom_line(aes(y=dados_plotagem[,i+1],group=1,color="Comportamento"),lwd=1.05) + theme_gray() + 
+    theme(plot.title=element_text(size=15, face="bold",hjust = 0.5))+theme(legend.title=element_blank(),axis.line = element_line(size = 0.5, colour = "gray")) + 
+    theme(legend.position="top") +
+    scale_color_manual(values=c("skyblue3","seagreen","black"))
+  print(grafico_comp)
+}
+
+```
+
+
+
+Cálculo de MAE para ambas as previsões:
+```{r}
+comportamento <- t(as.matrix(dados_teste %>% select(-DATA)))
+comportamento <- comportamento[,1:steps]
+
+MAE_v <- sum(abs(comportamento - previsao))/length(comportamento)
+
+MAE_v_sbs <- sum(abs(comportamento - previsao_sbs))/length(comportamento)
+
+RMSE_v_sbs <- sqrt(sum((comportamento - previsao_sbs)^2)/ length(comportamento))
+
+print(paste("MAE da Previsão Padrão:", round(MAE_v,digits=4)))
+print(paste("MAE da Previsão Step by Step:", round(MAE_v_sbs,digits=4)))
+print(paste("RMSE da Previsão Step by Step:", round(RMSE_v_sbs,digits=4)))
+```
+
+```{r}
+comportamento2 <- comportamento[,1:1]
+previsao2 <- previsao[,1]
+previsao_sbs2 <- previsao_sbs[,1]
+
+MAE_v2 <- sum(abs(comportamento2 - previsao2))/length(comportamento2)
+  
+MAE_v_sbs2 <- sum(abs(comportamento2 - previsao_sbs2))/length(comportamento2)
+
+RMSE_v_sbs2 <- sqrt(sum((comportamento2 - previsao_sbs2)^2)/ length(comportamento2))
+
+print(paste("MAE da Previsão Padrão:", round(MAE_v2,digits=4)))
+print(paste("MAE da Previsão Step by Step:", round(MAE_v_sbs2,digits=4)))
+print(paste("RMSE da Previsão Step by Step:", round(RMSE_v_sbs2,digits=4)))
+```
+
+Cálculo do erro absoluto:
+
+```{r}
+
+#Erro Previsão Normal
+erro <- matrix(nrow=steps, ncol=n_estacoes)
+for (i in 1:n_estacoes){
+  erro[,i] <- abs(comportamento[i,] - previsao[i,])
+}
+
+erro_plot <- as.data.frame(erro)
+colnames(erro_plot) <- radar_prev
+erro_plot <- rownames_to_column(erro_plot,var="Timelags")
+erro_plot <- erro_plot %>% mutate(Timelags = as.integer(Timelags))
+
+#Erro Previsão Step by Step
+erro_sbs <- matrix(nrow=steps, ncol=n_estacoes)
+for (i in 1:n_estacoes){
+  erro_sbs[,i] <- abs(comportamento[i,] - previsao_sbs[i,])
+}
+
+erro_sbs_plot <- as.data.frame(erro_sbs)
+colnames(erro_sbs_plot) <- radar_prev
+erro_sbs_plot <- rownames_to_column(erro_sbs_plot,var="Timelags")
+erro_sbs_plot <- erro_sbs_plot %>% mutate(Timelags = as.integer(Timelags))
+
+```
+
+```{r}
+erro_sbs
+```
+
+
+Plotagem dos Erros:
+
+```{r}
+cabecalho_sbs <- c()
+cabecalho_norm <- c()
+for (i in 1:n_estacoes){
+    cabecalho_sbs[i] <- paste(estacoes[i],"Step by step",sep = "-")
+    cabecalho_norm[i] <- estacoes[i]
+
+}
+
+colnames(erro_plot) <- c("Timelags",cabecalho_norm)
+colnames(erro_sbs_plot) <- c("Timelags",cabecalho_sbs)
+erro_rel <- join(erro_plot,erro_sbs_plot,by="Timelags")
+
+
+
+#USAR O CÓDIGO ABAIXO CASO NÃO PRECISE PLOTAR A PREVISÃO STEP BY STEP COM ATUALIZAÇÃO DE PARÂMETROS
+cores <- c("seagreen","salmon")
+for (i in 1:n_estacoes){
+  grafico_erro <- ggplot(data=erro_rel,aes(x=Timelags)) + labs(title = paste0("Erro Absoluto ao Longo do Tempo - ",radar_prev[i]), x="Timelags", y="Erro Absoluto") + 
+    # geom_line(aes(y = erro_rel[,i+1],group=1,color="Previsão Normal",linetype='Previsão Normal'),lty=2,lwd=1.03) + 
+    geom_line(aes(y = erro_rel[,i+1+n_estacoes],group=1,color="Previsão Step by Step",linetype='Previsão Step by Step'),lty=1,lwd=1.03) + 
+    theme_gray() + theme(plot.title=element_text(size=15, face="bold",hjust = 0.5))+theme(legend.title=element_blank(),axis.line = element_line(size = 0.5, colour = "lightgray"),legend.position="top",legend.key.size = unit(1.5,"line")) + 
+    scale_color_manual(values=cores)
+  print(grafico_erro)
+}
+
+
+```
